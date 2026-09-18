@@ -114,15 +114,26 @@ def test_double_dash_content_line_is_a_removal() -> None:
 def test_thread_on_removed_line_resolves() -> None:
     discussion = _discussion(line=2)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
+    assert provider.reconcile_code_suggestion_threads() == 1
     assert discussion.resolved is True
     discussion.save.assert_called_once()
+
+
+def test_compare_uses_straight_diff() -> None:
+    # The default merge-base comparison would report lines dropped by a rebase
+    # as removed; the sweep must compare the recorded head to the current head
+    # directly.
+    discussion = _discussion(line=2)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
+    provider.reconcile_code_suggestion_threads()
+    provider.gl.projects.get.return_value.repository_compare.assert_called_once_with(
+        OLD_SHA, HEAD_SHA, straight=True)
 
 
 def test_thread_on_untouched_line_stays_open() -> None:
     discussion = _discussion(line=3)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     assert discussion.resolved is False
     discussion.save.assert_not_called()
 
@@ -132,14 +143,14 @@ def test_insertion_at_flagged_position_does_not_resolve() -> None:
     # thread: coordinates belong to the comment's head, not the current one.
     discussion = _discussion(line=2)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": INSERT_ONLY_PATCH}])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     assert discussion.resolved is False
 
 
 def test_thread_on_current_head_is_not_compared() -> None:
     discussion = _discussion(line=2, head_sha=HEAD_SHA)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     provider.gl.projects.get.return_value.repository_compare.assert_not_called()
     assert discussion.resolved is False
 
@@ -151,7 +162,7 @@ def test_ineligible_threads_skip_compare() -> None:
     resolved_thread = _discussion(line=2, resolved=True)
     provider = _provider([foreign, other_author, resolved_thread],
                          [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     provider.gl.projects.get.return_value.repository_compare.assert_not_called()
     for d in (foreign, other_author, resolved_thread):
         d.save.assert_not_called()
@@ -162,7 +173,7 @@ def test_object_shaped_compare_response_is_handled() -> None:
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
     provider.gl.projects.get.return_value.repository_compare.return_value = SimpleNamespace(
         diffs=[SimpleNamespace(new_path="app.py", old_path="app.py", diff=PATCH)])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     assert discussion.resolved is True
 
 
@@ -170,7 +181,7 @@ def test_disabled_flag_is_noop() -> None:
     get_settings().set("gitlab.auto_resolve_fixed_inline_threads", False)
     discussion = _discussion(line=2)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     provider.mr.discussions.list.assert_not_called()
     assert discussion.resolved is False
 
@@ -179,7 +190,7 @@ def test_non_agent_and_other_author_threads_stay_open() -> None:
     foreign = _discussion(line=2, body="a human comment")
     other_author = _discussion(line=2, author_id=999)
     provider = _provider([foreign, other_author], [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
     assert foreign.resolved is False
     assert other_author.resolved is False
 
@@ -201,60 +212,19 @@ def test_deletion_anchored_thread_stays_open() -> None:
     assert not _flagged_line_removed(position, {"app.py": {2}})
 
 
-async def test_clean_rerun_still_resolves_fixed_threads(monkeypatch) -> None:
-    import pr_agent.agent.pr_agent as pr_agent_module
-
-    class FakeTool:
-        def __init__(self, pr_url, ai_handler, args):
-            pass
-
-        async def run(self):
-            pass
-
-    provider = SimpleNamespace(resolve_fixed_inline_threads=MagicMock())
-    provider_factory = MagicMock(return_value=provider)
-    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
-    monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda args: (True, None))
-    monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
-    monkeypatch.setattr(pr_agent_module, "get_git_provider_with_context", provider_factory)
-    monkeypatch.setitem(pr_agent_module.command2class, "custom", FakeTool)
-
-    handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
-        "https://example/pr/1", "/custom")
-    assert handled is True
-    provider_factory.assert_called_once_with("https://example/pr/1")
-    provider.resolve_fixed_inline_threads.assert_called_once()
-
-
 def test_repeat_sweep_costs_no_api_calls() -> None:
-    # The post-command cleanup and the pre-publish cleanup share one provider;
-    # the second call must not list discussions again.
+    # PRCodeSuggestions.run() and publish_code_suggestions share one provider;
+    # the second sweep must not list discussions again.
     discussion = _discussion(line=3)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
-    provider.resolve_fixed_inline_threads()
-    provider.resolve_fixed_inline_threads()
+    provider.reconcile_code_suggestion_threads()
+    provider.reconcile_code_suggestion_threads()
     provider.mr.discussions.list.assert_called_once()
 
 
-async def test_disabled_flag_skips_cleanup_dispatch(monkeypatch) -> None:
-    import pr_agent.agent.pr_agent as pr_agent_module
-    get_settings().set("gitlab.auto_resolve_fixed_inline_threads", False)
-
-    class FakeTool:
-        def __init__(self, pr_url, ai_handler, args):
-            pass
-
-        async def run(self):
-            pass
-
-    provider_factory = MagicMock()
-    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
-    monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda args: (True, None))
-    monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
-    monkeypatch.setattr(pr_agent_module, "get_git_provider_with_context", provider_factory)
-    monkeypatch.setitem(pr_agent_module.command2class, "custom", FakeTool)
-
-    handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
-        "https://example/pr/1", "/custom")
-    assert handled is True
-    provider_factory.assert_not_called()
+def test_supports_code_suggestion_state() -> None:
+    # PRCodeSuggestions.run() calls reconcile_code_suggestion_threads through
+    # the generic provider contract when this reports support.
+    provider = _provider([], [])
+    assert provider.supports_code_suggestion_state() is True
+    assert provider.reconcile_code_suggestion_threads() == 0

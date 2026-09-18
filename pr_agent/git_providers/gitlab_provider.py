@@ -1054,6 +1054,12 @@ class GitLabProvider(GitProvider):
     def supports_review_finding_state(self) -> bool:
         return True
 
+    def supports_code_suggestion_state(self) -> bool:
+        return True
+
+    def get_code_suggestion_thread_context(self) -> str:
+        return ""
+
     def is_comment_authored_by_pr_agent(self, comment) -> bool:
         if isinstance(comment, dict):
             author = comment.get("author") or comment.get("user")
@@ -1179,7 +1185,10 @@ class GitLabProvider(GitProvider):
         removed = {}
         try:
             project = self.gl.projects.get(self.id_project)
-            comparison = project.repository_compare(base_sha, head_sha)
+            # straight=True: direct base..head comparison. The default merge-base
+            # comparison reports lines dropped by a rebase/merge as removed, which
+            # would resolve threads whose flagged code still exists at head.
+            comparison = project.repository_compare(base_sha, head_sha, straight=True)
         except Exception as e:
             get_logger().warning(
                 f"Could not compare {base_sha[:12]}..{head_sha[:12]} for fixed-thread detection: {e}")
@@ -1199,11 +1208,11 @@ class GitLabProvider(GitProvider):
                 removed.setdefault(path, set()).update(_removed_lines_from_patch(diff.get('diff')))
         return removed
 
-    def resolve_fixed_inline_threads(self):
+    def reconcile_code_suggestion_threads(self) -> int:
         if not get_settings().get("GITLAB.AUTO_RESOLVE_FIXED_INLINE_THREADS", False):
-            return
+            return 0
         if getattr(self, '_fixed_threads_swept', False):
-            return  # one sweep per process: repeats only burn API calls
+            return 0  # one sweep per process: repeats only burn API calls
         own_user_id = self._get_own_user_id()
         try:
             current_head_sha = self.mr.diff_refs['head_sha']
@@ -1214,12 +1223,12 @@ class GitLabProvider(GitProvider):
                 f"Skipping fixed inline thread cleanup on merge request {self.id_mr} "
                 f"(bot user: {own_user_id}, current head sha: {current_head_sha})"
             )
-            return
+            return 0
         try:
             discussions = self.mr.discussions.list(get_all=True)
         except Exception as e:
             get_logger().warning(f"Failed to list discussions of merge request {self.id_mr}: {e}")
-            return
+            return 0
         self._fixed_threads_swept = True
         # Threads pinned to the same head share one compare call.
         removed_lines_cache = {}
@@ -1261,6 +1270,7 @@ class GitLabProvider(GitProvider):
         if resolved:
             get_logger().info(
                 f"Resolved {resolved} fixed inline thread(s) on merge request {self.id_mr}")
+        return resolved
 
     def edit_comment_from_comment_id(self, comment_id: int, body: str):
         body = self.limit_output_characters(body, self.max_comment_chars)
@@ -1442,7 +1452,7 @@ class GitLabProvider(GitProvider):
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
         # Runs first so the fingerprints it frees are in the store before any dedup lookup.
         self.resolve_outdated_inline_threads()
-        self.resolve_fixed_inline_threads()
+        self.reconcile_code_suggestion_threads()
         # When true, suggestions are queued as GitLab draft notes and published together in a single
         # batch at the end, instead of each one going out as its own live discussion (and its own
         # notification/email) as soon as it's created.
