@@ -8,8 +8,8 @@ import pytest
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.gitlab_provider import (
     GitLabProvider,
-    _added_lines_from_patch,
     _is_fixed_own_inline_thread,
+    _removed_lines_from_patch,
 )
 
 from ._settings_helpers import restore_settings, snapshot_settings
@@ -29,6 +29,13 @@ PATCH = """\
 @@ -10,2 +10,3 @@
  ctx
 +added
+ ctx
+"""
+
+INSERT_ONLY_PATCH = """\
+@@ -1,2 +1,3 @@
+ ctx
++inserted
  ctx
 """
 
@@ -72,29 +79,39 @@ def flag():
     restore_settings(snapshot)
 
 
-def test_added_lines_from_patch() -> None:
-    assert _added_lines_from_patch(PATCH) == {2, 3, 11}
+def test_removed_lines_from_patch() -> None:
+    assert _removed_lines_from_patch(PATCH) == {2}
+    assert _removed_lines_from_patch(INSERT_ONLY_PATCH) == set()
 
 
-def test_thread_on_modified_line_resolves() -> None:
-    discussion = _discussion(line=3)
-    provider = _provider([discussion], [{"new_path": "app.py", "diff": PATCH}])
+def test_thread_on_removed_line_resolves() -> None:
+    discussion = _discussion(line=2)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
     provider.resolve_fixed_inline_threads()
     assert discussion.resolved is True
     discussion.save.assert_called_once()
 
 
 def test_thread_on_untouched_line_stays_open() -> None:
-    discussion = _discussion(line=99)
-    provider = _provider([discussion], [{"new_path": "app.py", "diff": PATCH}])
+    discussion = _discussion(line=3)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
     provider.resolve_fixed_inline_threads()
     assert discussion.resolved is False
     discussion.save.assert_not_called()
 
 
+def test_insertion_at_flagged_position_does_not_resolve() -> None:
+    # A line inserted where the comment used to point must not resolve the
+    # thread: coordinates belong to the comment's head, not the current one.
+    discussion = _discussion(line=2)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": INSERT_ONLY_PATCH}])
+    provider.resolve_fixed_inline_threads()
+    assert discussion.resolved is False
+
+
 def test_thread_on_current_head_is_not_compared() -> None:
-    discussion = _discussion(line=3, head_sha=HEAD_SHA)
-    provider = _provider([discussion], [{"new_path": "app.py", "diff": PATCH}])
+    discussion = _discussion(line=2, head_sha=HEAD_SHA)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
     provider.resolve_fixed_inline_threads()
     provider.gl.projects.get.return_value.repository_compare.assert_not_called()
     assert discussion.resolved is False
@@ -102,17 +119,17 @@ def test_thread_on_current_head_is_not_compared() -> None:
 
 def test_disabled_flag_is_noop() -> None:
     get_settings().set("gitlab.auto_resolve_fixed_inline_threads", False)
-    discussion = _discussion(line=3)
-    provider = _provider([discussion], [{"new_path": "app.py", "diff": PATCH}])
+    discussion = _discussion(line=2)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
     provider.resolve_fixed_inline_threads()
     provider.mr.discussions.list.assert_not_called()
     assert discussion.resolved is False
 
 
 def test_non_agent_and_other_author_threads_stay_open() -> None:
-    foreign = _discussion(line=3, body="a human comment")
-    other_author = _discussion(line=3, author_id=999)
-    provider = _provider([foreign, other_author], [{"new_path": "app.py", "diff": PATCH}])
+    foreign = _discussion(line=2, body="a human comment")
+    other_author = _discussion(line=2, author_id=999)
+    provider = _provider([foreign, other_author], [{"old_path": "app.py", "diff": PATCH}])
     provider.resolve_fixed_inline_threads()
     assert foreign.resolved is False
     assert other_author.resolved is False
@@ -120,8 +137,8 @@ def test_non_agent_and_other_author_threads_stay_open() -> None:
 
 def test_is_fixed_own_inline_thread_guards() -> None:
     assert not _is_fixed_own_inline_thread(
-        _discussion(resolved=True), BOT_ID, {"app.py": {3}})
+        _discussion(resolved=True), BOT_ID, {"app.py": {2}})
     assert not _is_fixed_own_inline_thread(
-        _discussion(body="human"), BOT_ID, {"app.py": {3}})
+        _discussion(body="human"), BOT_ID, {"app.py": {2}})
     assert _is_fixed_own_inline_thread(
-        _discussion(line=3), BOT_ID, {"app.py": {3}})
+        _discussion(line=2), BOT_ID, {"app.py": {2}})

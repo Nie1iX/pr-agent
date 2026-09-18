@@ -73,28 +73,28 @@ def _parse_gitlab_iso_datetime(value) -> Optional[datetime]:
         return None
 
 
-def _added_lines_from_patch(patch: str) -> set:
-    """Line numbers in the head file that a unified-diff patch adds."""
-    added = set()
-    new_line = None
+def _removed_lines_from_patch(patch: str) -> set:
+    """Line numbers in the base file that a unified-diff patch removes."""
+    removed = set()
+    base_line = None
     for raw in (patch or "").splitlines():
-        match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+        match = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", raw)
         if match:
-            new_line = int(match.group(1))
+            base_line = int(match.group(1))
             continue
-        if new_line is None:
+        if base_line is None:
             continue
-        if raw.startswith("+++"):
+        if raw.startswith("---"):
             continue
-        if raw.startswith("+"):
-            added.add(new_line)
-            new_line += 1
-        elif not raw.startswith("-"):
-            new_line += 1
-    return added
+        if raw.startswith("-"):
+            removed.add(base_line)
+            base_line += 1
+        elif not raw.startswith("+"):
+            base_line += 1
+    return removed
 
 
-def _is_fixed_own_inline_thread(discussion, own_user_id: int, added_lines: dict) -> bool:
+def _is_fixed_own_inline_thread(discussion, own_user_id: int, removed_lines: dict) -> bool:
     notes = discussion.attributes.get('notes') or []
     if not notes or not isinstance(notes[0], dict):
         return False
@@ -115,11 +115,14 @@ def _is_fixed_own_inline_thread(discussion, own_user_id: int, added_lines: dict)
         author_id = author.get('id') if isinstance(author, dict) else None
         if author_id != own_user_id:
             return False
+    # The compare base is the comment's head sha, so base coordinates are the
+    # comment-time coordinates: a flagged line resolves only when that exact
+    # line was removed/replaced. Lines merely shifted by insertions stay open.
     path = position.get('new_path') or position.get('old_path')
     line = position.get('new_line') if position.get('new_line') is not None else position.get('old_line')
     if not path or line is None:
         return False
-    return line in (added_lines.get(path) or set())
+    return line in (removed_lines.get(path) or set())
 
 
 def _is_outdated_own_inline_thread(discussion, own_user_id: int, current_head_sha: str) -> bool:
@@ -1163,21 +1166,21 @@ class GitLabProvider(GitProvider):
             get_logger().info(
                 f"Resolved {resolved} outdated inline thread(s) on merge request {self.id_mr}")
 
-    def _added_lines_since(self, base_sha: str, head_sha: str) -> dict:
-        """Added head line numbers per path between two commits, via repository_compare."""
-        added = {}
+    def _removed_lines_since(self, base_sha: str, head_sha: str) -> dict:
+        """Base-side line numbers removed per path between two commits, via repository_compare."""
+        removed = {}
         try:
             project = self.gl.projects.get(self.id_project)
             comparison = project.repository_compare(base_sha, head_sha)
         except Exception as e:
             get_logger().warning(
                 f"Could not compare {base_sha[:12]}..{head_sha[:12]} for fixed-thread detection: {e}")
-            return added
+            return removed
         for diff in comparison.get('diffs', []) or []:
-            path = diff.get('new_path') or diff.get('old_path')
+            path = diff.get('old_path') or diff.get('new_path')
             if path:
-                added.setdefault(path, set()).update(_added_lines_from_patch(diff.get('diff')))
-        return added
+                removed.setdefault(path, set()).update(_removed_lines_from_patch(diff.get('diff')))
+        return removed
 
     def resolve_fixed_inline_threads(self):
         if not get_settings().get("GITLAB.AUTO_RESOLVE_FIXED_INLINE_THREADS", False):
@@ -1199,15 +1202,15 @@ class GitLabProvider(GitProvider):
             get_logger().warning(f"Failed to list discussions of merge request {self.id_mr}: {e}")
             return
         # Threads pinned to the same head share one compare call.
-        added_lines_cache = {}
+        removed_lines_cache = {}
 
-        def added_lines_for(position) -> dict:
+        def removed_lines_for(position) -> dict:
             recorded = position.get('head_sha')
             if not recorded or recorded == current_head_sha:
                 return None  # nothing pushed since the comment - nothing could be fixed yet
-            if recorded not in added_lines_cache:
-                added_lines_cache[recorded] = self._added_lines_since(recorded, current_head_sha)
-            return added_lines_cache[recorded]
+            if recorded not in removed_lines_cache:
+                removed_lines_cache[recorded] = self._removed_lines_since(recorded, current_head_sha)
+            return removed_lines_cache[recorded]
 
         resolved = 0
         released_fps = set()
@@ -1216,10 +1219,10 @@ class GitLabProvider(GitProvider):
             try:
                 notes = discussion.attributes.get('notes') or []
                 position = notes[0].get('position') if notes and isinstance(notes[0], dict) else None
-                added_lines = added_lines_for(position) if isinstance(position, dict) else None
-                if added_lines is None:
+                removed_lines = removed_lines_for(position) if isinstance(position, dict) else None
+                if removed_lines is None:
                     continue
-                if not _is_fixed_own_inline_thread(discussion, own_user_id, added_lines):
+                if not _is_fixed_own_inline_thread(discussion, own_user_id, removed_lines):
                     continue
                 discussion.resolved = True
                 discussion.save()
