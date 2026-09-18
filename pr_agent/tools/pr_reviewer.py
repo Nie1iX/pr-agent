@@ -1078,12 +1078,16 @@ class PRReviewer:
             if not isinstance(verdicts, dict) or not isinstance(verdicts.get("verdicts"), list):
                 get_logger().warning("Findings verification returned no verdicts; keeping original findings")
                 return
-            supported = {
-                int(v["issue"]) for v in verdicts["verdicts"]
-                if isinstance(v, dict) and v.get("supported") is True
-            }
-            # Issues without a verdict are kept: the gate only drops on a positive refute.
-            kept = [issue for i, issue in enumerate(issues, start=1) if i in supported or i > len(verdicts["verdicts"])]
+            refuted = set()
+            for v in verdicts["verdicts"]:
+                if isinstance(v, dict) and v.get("supported") is False:
+                    try:
+                        refuted.add(int(v["issue"]))
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            # The gate drops only on an explicit refute: missing, out-of-order or
+            # malformed verdicts keep their issue.
+            kept = [issue for i, issue in enumerate(issues, start=1) if i not in refuted]
             if len(kept) == len(issues):
                 get_logger().info("Findings verification kept all key issues")
                 return

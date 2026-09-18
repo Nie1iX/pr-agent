@@ -90,6 +90,40 @@ async def test_missing_verdict_keeps_the_issue() -> None:
     assert reviewer.prediction_data is None
 
 
+async def test_middle_missing_verdict_keeps_the_issue() -> None:
+    # Verdict for issue 2 skipped entirely: only the explicit refute of 3 may drop.
+    reviewer = _reviewer(
+        "verdicts:\n"
+        "  - issue: 1\n    supported: true\n"
+        "  - issue: 3\n    supported: false\n"
+    )
+    reviewer.prediction = PREDICTION.replace(
+        "    - relevant_file: src/b.py\n",
+        "    - relevant_file: src/b.py\n"
+        "      issue_header: Bug\n      issue_content: second\n"
+        "      start_line: 3\n      end_line: 4\n"
+        "    - relevant_file: src/c.py\n"
+        "      issue_header: Bug\n      issue_content: third\n"
+        "      start_line: 5\n      end_line: 6\n",
+        1,
+    )
+    await reviewer._verify_key_issues()
+    issues = reviewer.prediction_data["review"]["key_issues_to_review"]
+    assert [i["relevant_file"] for i in issues] == ["src/a.py", "src/b.py"]
+
+
+async def test_malformed_verdict_entry_is_ignored() -> None:
+    reviewer = _reviewer(
+        "verdicts:\n"
+        "  - issue: 1\n    supported: true\n"
+        "  - garbage\n"
+        "  - issue: 2\n    supported: false\n"
+    )
+    await reviewer._verify_key_issues()
+    issues = reviewer.prediction_data["review"]["key_issues_to_review"]
+    assert [i["relevant_file"] for i in issues] == ["src/a.py"]
+
+
 async def test_empty_issue_list_skips_model_call() -> None:
     reviewer = _reviewer(VERDICTS_DROP_SECOND)
     reviewer.prediction = "review:\n  key_issues_to_review: []\n"
