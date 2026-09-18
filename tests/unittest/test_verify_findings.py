@@ -211,3 +211,8 @@ async def test_chunk_verification_error_keeps_that_chunk() -> None:
     await reviewer._verify_chunked_key_issues()
     kept = reviewer._chunked_results[0][1]["review"]["key_issues_to_review"]
     assert [i["relevant_file"] for i in kept] == ["src/a.py"]
+
+
+def test_verify_prompt_marks_payloads_as_untrusted() -> None:
+    system = get_settings().pr_verify_findings_prompt.system
+    assert "untrusted" in system
