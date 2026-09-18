@@ -13,6 +13,7 @@ from pr_agent.algo.ai_handlers.litellm_ai_handler import LiteLLMAIHandler
 from pr_agent.algo.cli_args import CliArgs
 from pr_agent.algo.utils import update_settings_from_args
 from pr_agent.config_loader import get_settings, global_settings
+from pr_agent.git_providers import get_git_provider_with_context
 from pr_agent.git_providers.utils import apply_repo_settings
 from pr_agent.log import get_logger
 from pr_agent.telemetry.meter import get_commands_counter
@@ -317,6 +318,19 @@ class PRAgent:
                         notify()
 
                     await command2class[action](pr_url, ai_handler=self.ai_handler, args=args).run()
+
+                # Fixed-thread cleanup also runs on reruns that publish nothing;
+                # publish_code_suggestions is skipped on clean reviews.
+                if get_settings().get("gitlab.auto_resolve_fixed_inline_threads", False):
+                    try:
+                        resolver = getattr(
+                            get_git_provider_with_context(pr_url),
+                            "resolve_fixed_inline_threads", None)
+                        if callable(resolver):
+                            resolver()
+                    except Exception as e:
+                        get_logger().warning(
+                            f"Fixed inline thread cleanup failed for {pr_url}: {e}")
 
                 span.set_status(StatusCode.OK)
                 return True

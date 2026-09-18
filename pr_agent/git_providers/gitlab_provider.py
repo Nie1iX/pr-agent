@@ -123,11 +123,14 @@ def _flagged_line_removed(position: dict, removed_lines: dict) -> bool:
     # The compare base is the comment's head sha, so base coordinates are the
     # comment-time coordinates: a flagged line resolves only when that exact
     # line was removed/replaced. Lines merely shifted by insertions stay open.
-    path = position.get('new_path') or position.get('old_path')
-    line = position.get('new_line') if position.get('new_line') is not None else position.get('old_line')
-    if not path or line is None:
+    # Deletion-anchored comments carry only old_line - a coordinate in the MR
+    # base, not the comment's head - so they cannot be checked and stay open.
+    if position.get('new_line') is None:
         return False
-    return line in (removed_lines.get(path) or set())
+    path = position.get('new_path')
+    if not path:
+        return False
+    return position['new_line'] in (removed_lines.get(path) or set())
 
 
 def _is_outdated_own_inline_thread(discussion, own_user_id: int, current_head_sha: str) -> bool:

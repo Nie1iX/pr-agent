@@ -191,3 +191,60 @@ def test_thread_eligibility_guards() -> None:
     assert position is not None
     assert _flagged_line_removed(position, {"app.py": {2}})
     assert not _flagged_line_removed(position, {"app.py": {3}})
+
+
+def test_deletion_anchored_thread_stays_open() -> None:
+    # old_line is a coordinate in the MR base, not the comment head: a head-side
+    # removal at the same number must not resolve a deletion-anchored thread.
+    position = {"position_type": "text", "new_path": "app.py", "old_path": "app.py",
+                "old_line": 2, "head_sha": OLD_SHA}
+    assert not _flagged_line_removed(position, {"app.py": {2}})
+
+
+async def test_clean_rerun_still_resolves_fixed_threads(monkeypatch) -> None:
+    import pr_agent.agent.pr_agent as pr_agent_module
+
+    class FakeTool:
+        def __init__(self, pr_url, ai_handler, args):
+            pass
+
+        async def run(self):
+            pass
+
+    provider = SimpleNamespace(resolve_fixed_inline_threads=MagicMock())
+    provider_factory = MagicMock(return_value=provider)
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
+    monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda args: (True, None))
+    monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
+    monkeypatch.setattr(pr_agent_module, "get_git_provider_with_context", provider_factory)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", FakeTool)
+
+    handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
+        "https://example/pr/1", "/custom")
+    assert handled is True
+    provider_factory.assert_called_once_with("https://example/pr/1")
+    provider.resolve_fixed_inline_threads.assert_called_once()
+
+
+async def test_disabled_flag_skips_cleanup_dispatch(monkeypatch) -> None:
+    import pr_agent.agent.pr_agent as pr_agent_module
+    get_settings().set("gitlab.auto_resolve_fixed_inline_threads", False)
+
+    class FakeTool:
+        def __init__(self, pr_url, ai_handler, args):
+            pass
+
+        async def run(self):
+            pass
+
+    provider_factory = MagicMock()
+    monkeypatch.setattr(pr_agent_module, "apply_repo_settings", lambda pr_url: None)
+    monkeypatch.setattr(pr_agent_module.CliArgs, "validate_user_args", lambda args: (True, None))
+    monkeypatch.setattr(pr_agent_module, "update_settings_from_args", lambda args: args)
+    monkeypatch.setattr(pr_agent_module, "get_git_provider_with_context", provider_factory)
+    monkeypatch.setitem(pr_agent_module.command2class, "custom", FakeTool)
+
+    handled = await pr_agent_module.PRAgent(ai_handler="fake-ai")._handle_request(
+        "https://example/pr/1", "/custom")
+    assert handled is True
+    provider_factory.assert_not_called()
