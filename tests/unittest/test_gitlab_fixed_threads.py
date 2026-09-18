@@ -226,6 +226,16 @@ async def test_clean_rerun_still_resolves_fixed_threads(monkeypatch) -> None:
     provider.resolve_fixed_inline_threads.assert_called_once()
 
 
+def test_repeat_sweep_costs_no_api_calls() -> None:
+    # The post-command cleanup and the pre-publish cleanup share one provider;
+    # the second call must not list discussions again.
+    discussion = _discussion(line=3)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
+    provider.resolve_fixed_inline_threads()
+    provider.resolve_fixed_inline_threads()
+    provider.mr.discussions.list.assert_called_once()
+
+
 async def test_disabled_flag_skips_cleanup_dispatch(monkeypatch) -> None:
     import pr_agent.agent.pr_agent as pr_agent_module
     get_settings().set("gitlab.auto_resolve_fixed_inline_threads", False)

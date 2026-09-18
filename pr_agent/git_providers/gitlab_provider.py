@@ -1202,6 +1202,8 @@ class GitLabProvider(GitProvider):
     def resolve_fixed_inline_threads(self):
         if not get_settings().get("GITLAB.AUTO_RESOLVE_FIXED_INLINE_THREADS", False):
             return
+        if getattr(self, '_fixed_threads_swept', False):
+            return  # one sweep per process: repeats only burn API calls
         own_user_id = self._get_own_user_id()
         try:
             current_head_sha = self.mr.diff_refs['head_sha']
@@ -1218,6 +1220,7 @@ class GitLabProvider(GitProvider):
         except Exception as e:
             get_logger().warning(f"Failed to list discussions of merge request {self.id_mr}: {e}")
             return
+        self._fixed_threads_swept = True
         # Threads pinned to the same head share one compare call.
         removed_lines_cache = {}
 
