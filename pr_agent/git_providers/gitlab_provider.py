@@ -83,9 +83,9 @@ def _removed_lines_from_patch(patch: str) -> set:
             base_line = int(match.group(1))
             continue
         if base_line is None:
-            continue
-        if raw.startswith("---"):
-            continue
+            continue  # ---/+++ file headers arrive before the first hunk
+        if raw.startswith("\\"):
+            continue  # "\ No newline at end of file" metadata is not a file line
         if raw.startswith("-"):
             removed.add(base_line)
             base_line += 1
@@ -94,27 +94,32 @@ def _removed_lines_from_patch(patch: str) -> set:
     return removed
 
 
-def _is_fixed_own_inline_thread(discussion, own_user_id: int, removed_lines: dict) -> bool:
+def _eligible_own_inline_thread(discussion, own_user_id: int):
+    """Position dict of a bot-owned, open, resolvable text thread, else None."""
     notes = discussion.attributes.get('notes') or []
     if not notes or not isinstance(notes[0], dict):
-        return False
+        return None
     opener = notes[0]
     if opener.get('resolved') or opener.get('resolvable') is False:
-        return False
+        return None
     position = opener.get('position')
     if not isinstance(position, dict) or position.get('position_type') != 'text':
-        return False
+        return None
     if not is_agent_inline_comment(opener.get('body')):
-        return False
+        return None
     for note in notes:
         if not isinstance(note, dict):
-            return False
+            return None
         if note.get('system'):
             continue
         author = note.get('author')
         author_id = author.get('id') if isinstance(author, dict) else None
         if author_id != own_user_id:
-            return False
+            return None
+    return position
+
+
+def _flagged_line_removed(position: dict, removed_lines: dict) -> bool:
     # The compare base is the comment's head sha, so base coordinates are the
     # comment-time coordinates: a flagged line resolves only when that exact
     # line was removed/replaced. Lines merely shifted by insertions stay open.
@@ -1176,7 +1181,16 @@ class GitLabProvider(GitProvider):
             get_logger().warning(
                 f"Could not compare {base_sha[:12]}..{head_sha[:12]} for fixed-thread detection: {e}")
             return removed
-        for diff in comparison.get('diffs', []) or []:
+        if isinstance(comparison, dict):
+            diffs = comparison.get('diffs', []) or []
+        else:
+            diffs = getattr(comparison, 'diffs', []) or []
+        for diff in diffs:
+            # Compare entries are dicts in practice; normalize object-shaped
+            # responses the same way the incremental-review path does.
+            if not isinstance(diff, dict):
+                diff = {key: getattr(diff, key, None)
+                        for key in ('new_path', 'old_path', 'diff')}
             path = diff.get('old_path') or diff.get('new_path')
             if path:
                 removed.setdefault(path, set()).update(_removed_lines_from_patch(diff.get('diff')))
@@ -1218,11 +1232,15 @@ class GitLabProvider(GitProvider):
             discussion_id = getattr(discussion, 'id', None)
             try:
                 notes = discussion.attributes.get('notes') or []
-                position = notes[0].get('position') if notes and isinstance(notes[0], dict) else None
-                removed_lines = removed_lines_for(position) if isinstance(position, dict) else None
+                # Cheap eligibility guards first: ineligible discussions must not
+                # trigger a repository_compare call.
+                position = _eligible_own_inline_thread(discussion, own_user_id)
+                if position is None:
+                    continue
+                removed_lines = removed_lines_for(position)
                 if removed_lines is None:
                     continue
-                if not _is_fixed_own_inline_thread(discussion, own_user_id, removed_lines):
+                if not _flagged_line_removed(position, removed_lines):
                     continue
                 discussion.resolved = True
                 discussion.save()

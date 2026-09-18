@@ -8,7 +8,8 @@ import pytest
 from pr_agent.config_loader import get_settings
 from pr_agent.git_providers.gitlab_provider import (
     GitLabProvider,
-    _is_fixed_own_inline_thread,
+    _eligible_own_inline_thread,
+    _flagged_line_removed,
     _removed_lines_from_patch,
 )
 
@@ -36,6 +37,22 @@ INSERT_ONLY_PATCH = """\
 @@ -1,2 +1,3 @@
  ctx
 +inserted
+ ctx
+"""
+
+NO_NEWLINE_PATCH = """\
+@@ -1,3 +1,3 @@
+ ctx
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+"""
+
+DOUBLE_DASH_PATCH = """\
+@@ -1,3 +1,3 @@
+ ctx
+---flag
  ctx
 """
 
@@ -84,6 +101,16 @@ def test_removed_lines_from_patch() -> None:
     assert _removed_lines_from_patch(INSERT_ONLY_PATCH) == set()
 
 
+def test_no_newline_marker_is_not_a_file_line() -> None:
+    # "\ No newline at end of file" must not advance the base line counter.
+    assert _removed_lines_from_patch(NO_NEWLINE_PATCH) == {2}
+
+
+def test_double_dash_content_line_is_a_removal() -> None:
+    # A removed source line "--flag" is encoded as "---flag" inside the hunk.
+    assert _removed_lines_from_patch(DOUBLE_DASH_PATCH) == {2}
+
+
 def test_thread_on_removed_line_resolves() -> None:
     discussion = _discussion(line=2)
     provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
@@ -117,6 +144,28 @@ def test_thread_on_current_head_is_not_compared() -> None:
     assert discussion.resolved is False
 
 
+def test_ineligible_threads_skip_compare() -> None:
+    # Human and already-resolved threads must not cost a repository_compare call.
+    foreign = _discussion(line=2, body="a human comment")
+    other_author = _discussion(line=2, author_id=999)
+    resolved_thread = _discussion(line=2, resolved=True)
+    provider = _provider([foreign, other_author, resolved_thread],
+                         [{"old_path": "app.py", "diff": PATCH}])
+    provider.resolve_fixed_inline_threads()
+    provider.gl.projects.get.return_value.repository_compare.assert_not_called()
+    for d in (foreign, other_author, resolved_thread):
+        d.save.assert_not_called()
+
+
+def test_object_shaped_compare_response_is_handled() -> None:
+    discussion = _discussion(line=2)
+    provider = _provider([discussion], [{"old_path": "app.py", "diff": PATCH}])
+    provider.gl.projects.get.return_value.repository_compare.return_value = SimpleNamespace(
+        diffs=[SimpleNamespace(new_path="app.py", old_path="app.py", diff=PATCH)])
+    provider.resolve_fixed_inline_threads()
+    assert discussion.resolved is True
+
+
 def test_disabled_flag_is_noop() -> None:
     get_settings().set("gitlab.auto_resolve_fixed_inline_threads", False)
     discussion = _discussion(line=2)
@@ -135,10 +184,10 @@ def test_non_agent_and_other_author_threads_stay_open() -> None:
     assert other_author.resolved is False
 
 
-def test_is_fixed_own_inline_thread_guards() -> None:
-    assert not _is_fixed_own_inline_thread(
-        _discussion(resolved=True), BOT_ID, {"app.py": {2}})
-    assert not _is_fixed_own_inline_thread(
-        _discussion(body="human"), BOT_ID, {"app.py": {2}})
-    assert _is_fixed_own_inline_thread(
-        _discussion(line=2), BOT_ID, {"app.py": {2}})
+def test_thread_eligibility_guards() -> None:
+    assert _eligible_own_inline_thread(_discussion(resolved=True), BOT_ID) is None
+    assert _eligible_own_inline_thread(_discussion(body="human"), BOT_ID) is None
+    position = _eligible_own_inline_thread(_discussion(line=2), BOT_ID)
+    assert position is not None
+    assert _flagged_line_removed(position, {"app.py": {2}})
+    assert not _flagged_line_removed(position, {"app.py": {3}})

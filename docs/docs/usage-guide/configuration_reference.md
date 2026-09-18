@@ -363,6 +363,7 @@ _This section only documents commented-out examples; see the [TOML source](https
 | `publish_improve_as_thread` | false | Post the /improve suggestions comment as a resolvable thread (discussion) instead of a plain note. |
 | `publish_code_suggestions_as_review` | false | When pr_code_suggestions.commitable_code_suggestions is true, queue each suggestion as a GitLab draft note and publish them all together in one batch (like GitLab's own "start a review" flow) instead of posting each as its own live discussion - and its own notification - as soon as it's created. |
 | `resolve_outdated_inline_threads` | false | Resolve the bot's own inline threads that a later push left on an outdated diff version. |
+| `auto_resolve_fixed_inline_threads` | false | Resolve the bot's own inline threads whose flagged line was removed or replaced between the comment's head sha and the current head sha. Content-based alternative to resolve_outdated_inline_threads: threads on untouched or merely shifted lines stay open. |
 | `handle_push_trigger` | false |  |
 | `push_commands` | ["/describe", "/review"] |  |
 | `handle_reviewer_assignment` | false | Auto-trigger commands when the bot is assigned as a reviewer on an MR |
