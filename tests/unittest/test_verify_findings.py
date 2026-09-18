@@ -41,6 +41,7 @@ def _reviewer(verdicts: str) -> PRReviewer:
     reviewer.prediction = PREDICTION
     reviewer.prediction_data = None
     reviewer.patches_diff = "diff --git a/src/a.py b/src/a.py\n+new\n"
+    reviewer.git_provider = None
     reviewer.ai_handler = MagicMock()
     reviewer.ai_handler.chat_completion = AsyncMock(return_value=(verdicts, "stop"))
     return reviewer
@@ -48,8 +49,11 @@ def _reviewer(verdicts: str) -> PRReviewer:
 
 @pytest.fixture(autouse=True)
 def verify_flag():
-    snapshot = snapshot_settings(["pr_reviewer.verify_findings"])
+    snapshot = snapshot_settings(
+        ["pr_reviewer.verify_findings", "config.model", "config.fallback_models"])
     get_settings().set("pr_reviewer.verify_findings", True)
+    get_settings().set("config.model", "test-model")
+    get_settings().set("config.fallback_models", [])
     yield
     restore_settings(snapshot)
 

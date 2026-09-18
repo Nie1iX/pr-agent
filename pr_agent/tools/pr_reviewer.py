@@ -1047,8 +1047,8 @@ class PRReviewer:
 
         return response
 
-    async def _verify_issue_list(self, issues: list, diff: str) -> list:
-        """Second-pass check of key issues against the diff that produced them.
+    async def _verify_issue_list(self, issues: list, diff: str, model: str) -> list:
+        """Check key issues against the diff that produced them in a second pass.
 
         Returns the issues the model did not explicitly refute: only a verdict
         with an exact in-range integer 'issue' id and 'supported: false' drops a
@@ -1063,7 +1063,7 @@ class PRReviewer:
             "issue_count": len(issues),
         })
         response, _ = await self.ai_handler.chat_completion(
-            model=get_settings().config.model,
+            model=model,
             temperature=0,
             system=system_prompt,
             user=user_prompt,
@@ -1100,15 +1100,21 @@ class PRReviewer:
                 issues = data.get("review", {}).get("key_issues_to_review")
                 if not isinstance(issues, list) or not issues or index >= len(chunks):
                     continue
-                kept = await self._verify_issue_list(issues, chunks[index])
+                # Verification follows the same fallback chain as the review: a
+                # verdict call against an unavailable primary must not skip the gate.
+                kept = await retry_with_fallback_models(
+                    partial(self._verify_issue_list, issues, chunks[index]),
+                    model_type=ModelType.REGULAR,
+                    git_provider=self.git_provider)
                 if len(kept) < len(issues):
                     data["review"]["key_issues_to_review"] = kept
             except Exception as e:
                 get_logger().warning(
-                    f"Chunk {index + 1} findings verification failed; keeping its findings: {e}")
+                    f"Chunk {index + 1} findings verification failed; keeping its findings",
+                    artifact={"error": e})
 
     async def _verify_key_issues(self) -> None:
-        """Optional second-pass gate: drop key issues the diff positively refutes.
+        """Drop key issues the diff positively refutes, in an optional second pass.
 
         Each 'key_issues_to_review' finding is checked against the diff in one
         extra model call; unsupported findings are removed before publishing.
@@ -1124,7 +1130,10 @@ class PRReviewer:
             issues = data.get("review", {}).get("key_issues_to_review")
             if not isinstance(issues, list) or not issues:
                 return
-            kept = await self._verify_issue_list(issues, self.patches_diff)
+            kept = await retry_with_fallback_models(
+                partial(self._verify_issue_list, issues, self.patches_diff),
+                model_type=ModelType.REGULAR,
+                git_provider=self.git_provider)
             if len(kept) == len(issues):
                 get_logger().info("Findings verification kept all key issues")
                 return
@@ -1134,7 +1143,8 @@ class PRReviewer:
             self._validate_review_schema(data)
             self.prediction_data = data
         except Exception as e:
-            get_logger().warning(f"Findings verification failed; keeping original findings: {e}")
+            get_logger().warning("Findings verification failed; keeping original findings",
+                                 artifact={"error": e})
 
     @staticmethod
     def _load_review_yaml(prediction: str) -> dict:
