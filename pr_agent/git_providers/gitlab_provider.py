@@ -73,6 +73,55 @@ def _parse_gitlab_iso_datetime(value) -> Optional[datetime]:
         return None
 
 
+def _added_lines_from_patch(patch: str) -> set:
+    """Line numbers in the head file that a unified-diff patch adds."""
+    added = set()
+    new_line = None
+    for raw in (patch or "").splitlines():
+        match = re.match(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
+        if match:
+            new_line = int(match.group(1))
+            continue
+        if new_line is None:
+            continue
+        if raw.startswith("+++"):
+            continue
+        if raw.startswith("+"):
+            added.add(new_line)
+            new_line += 1
+        elif not raw.startswith("-"):
+            new_line += 1
+    return added
+
+
+def _is_fixed_own_inline_thread(discussion, own_user_id: int, added_lines: dict) -> bool:
+    notes = discussion.attributes.get('notes') or []
+    if not notes or not isinstance(notes[0], dict):
+        return False
+    opener = notes[0]
+    if opener.get('resolved') or opener.get('resolvable') is False:
+        return False
+    position = opener.get('position')
+    if not isinstance(position, dict) or position.get('position_type') != 'text':
+        return False
+    if not is_agent_inline_comment(opener.get('body')):
+        return False
+    for note in notes:
+        if not isinstance(note, dict):
+            return False
+        if note.get('system'):
+            continue
+        author = note.get('author')
+        author_id = author.get('id') if isinstance(author, dict) else None
+        if author_id != own_user_id:
+            return False
+    path = position.get('new_path') or position.get('old_path')
+    line = position.get('new_line') if position.get('new_line') is not None else position.get('old_line')
+    if not path or line is None:
+        return False
+    return line in (added_lines.get(path) or set())
+
+
 def _is_outdated_own_inline_thread(discussion, own_user_id: int, current_head_sha: str) -> bool:
     notes = discussion.attributes.get('notes') or []
     if not notes or not isinstance(notes[0], dict):
@@ -1114,6 +1163,78 @@ class GitLabProvider(GitProvider):
             get_logger().info(
                 f"Resolved {resolved} outdated inline thread(s) on merge request {self.id_mr}")
 
+    def _added_lines_since(self, base_sha: str, head_sha: str) -> dict:
+        """Added head line numbers per path between two commits, via repository_compare."""
+        added = {}
+        try:
+            project = self.gl.projects.get(self.id_project)
+            comparison = project.repository_compare(base_sha, head_sha)
+        except Exception as e:
+            get_logger().warning(
+                f"Could not compare {base_sha[:12]}..{head_sha[:12]} for fixed-thread detection: {e}")
+            return added
+        for diff in comparison.get('diffs', []) or []:
+            path = diff.get('new_path') or diff.get('old_path')
+            if path:
+                added.setdefault(path, set()).update(_added_lines_from_patch(diff.get('diff')))
+        return added
+
+    def resolve_fixed_inline_threads(self):
+        if not get_settings().get("GITLAB.AUTO_RESOLVE_FIXED_INLINE_THREADS", False):
+            return
+        own_user_id = self._get_own_user_id()
+        try:
+            current_head_sha = self.mr.diff_refs['head_sha']
+        except (KeyError, TypeError, AttributeError):
+            current_head_sha = None
+        if own_user_id is None or not current_head_sha:
+            get_logger().warning(
+                f"Skipping fixed inline thread cleanup on merge request {self.id_mr} "
+                f"(bot user: {own_user_id}, current head sha: {current_head_sha})"
+            )
+            return
+        try:
+            discussions = self.mr.discussions.list(get_all=True)
+        except Exception as e:
+            get_logger().warning(f"Failed to list discussions of merge request {self.id_mr}: {e}")
+            return
+        # Threads pinned to the same head share one compare call.
+        added_lines_cache = {}
+
+        def added_lines_for(position) -> dict:
+            recorded = position.get('head_sha')
+            if not recorded or recorded == current_head_sha:
+                return None  # nothing pushed since the comment - nothing could be fixed yet
+            if recorded not in added_lines_cache:
+                added_lines_cache[recorded] = self._added_lines_since(recorded, current_head_sha)
+            return added_lines_cache[recorded]
+
+        resolved = 0
+        released_fps = set()
+        for discussion in discussions:
+            discussion_id = getattr(discussion, 'id', None)
+            try:
+                notes = discussion.attributes.get('notes') or []
+                position = notes[0].get('position') if notes and isinstance(notes[0], dict) else None
+                added_lines = added_lines_for(position) if isinstance(position, dict) else None
+                if added_lines is None:
+                    continue
+                if not _is_fixed_own_inline_thread(discussion, own_user_id, added_lines):
+                    continue
+                discussion.resolved = True
+                discussion.save()
+                resolved += 1
+                for note in notes:
+                    if isinstance(note, dict):
+                        released_fps |= marker_fingerprints(note.get('body'))
+            except Exception as e:
+                get_logger().warning(f"Failed to resolve fixed inline thread {discussion_id}: {e}")
+        if released_fps:
+            get_inline_comment_store(self).release(released_fps)
+        if resolved:
+            get_logger().info(
+                f"Resolved {resolved} fixed inline thread(s) on merge request {self.id_mr}")
+
     def edit_comment_from_comment_id(self, comment_id: int, body: str):
         body = self.limit_output_characters(body, self.max_comment_chars)
         comment = self.mr.notes.get(comment_id)
@@ -1294,6 +1415,7 @@ class GitLabProvider(GitProvider):
     def publish_code_suggestions(self, code_suggestions: list) -> bool:
         # Runs first so the fingerprints it frees are in the store before any dedup lookup.
         self.resolve_outdated_inline_threads()
+        self.resolve_fixed_inline_threads()
         # When true, suggestions are queued as GitLab draft notes and published together in a single
         # batch at the end, instead of each one going out as its own live discussion (and its own
         # notification/email) as soon as it's created.
