@@ -1083,12 +1083,18 @@ class PRReviewer:
             get_logger().warning("Findings verification returned no verdicts; keeping original findings")
             return issues
         refuted = set()
+        seen_verdicts = {}
         for v in verdicts["verdicts"]:
             # Exact int required: int() coercion would let values like 1.9 or
             # true refute issue 1.
-            if (isinstance(v, dict) and v.get("supported") is False
+            if (isinstance(v, dict) and isinstance(v.get("supported"), bool)
                     and type(v.get("issue")) is int and 1 <= v["issue"] <= len(issues)):
-                refuted.add(v["issue"])
+                seen_verdicts.setdefault(v["issue"], []).append(v["supported"])
+        for issue_id, supports in seen_verdicts.items():
+            # A single unambiguous false refutes; repeats or contradictions are
+            # contract violations, so the finding stays.
+            if supports == [False]:
+                refuted.add(issue_id)
         kept = [issue for i, issue in enumerate(issues, start=1) if i not in refuted]
         if len(kept) < len(issues):
             get_logger().info(

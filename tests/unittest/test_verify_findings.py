@@ -216,3 +216,39 @@ async def test_chunk_verification_error_keeps_that_chunk() -> None:
 def test_verify_prompt_marks_payloads_as_untrusted() -> None:
     system = get_settings().pr_verify_findings_prompt.system
     assert "untrusted" in system
+
+
+async def test_conflicting_verdicts_keep_the_finding() -> None:
+    verdicts = (
+        "verdicts:\n"
+        "  - issue: 1\n"
+        "    supported: true\n"
+        "    reason: present in diff\n"
+        "  - issue: 1\n"
+        "    supported: false\n"
+        "    reason: contradicts itself\n"
+        "  - issue: 2\n"
+        "    supported: false\n"
+        "    reason: code not in diff\n"
+    )
+    reviewer = _reviewer(verdicts)
+    await reviewer._verify_key_issues()
+    issues = reviewer.prediction_data["review"]["key_issues_to_review"]
+    assert [i["relevant_file"] for i in issues] == ["src/a.py"]
+
+
+async def test_duplicate_false_verdict_keeps_the_finding() -> None:
+    verdicts = (
+        "verdicts:\n"
+        "  - issue: 1\n"
+        "    supported: false\n"
+        "    reason: code not in diff\n"
+        "  - issue: 1\n"
+        "    supported: false\n"
+        "    reason: code not in diff\n"
+    )
+    reviewer = _reviewer(verdicts)
+    await reviewer._verify_key_issues()
+    # Both entries agree but the contract demands one verdict per issue:
+    # ambiguous output retains the finding, so nothing is dropped.
+    assert reviewer.prediction_data is None
