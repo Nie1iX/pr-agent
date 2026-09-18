@@ -5,6 +5,8 @@ import re
 from functools import partial
 from typing import List, Optional, Tuple
 
+import yaml
+from jinja2 import Environment, StrictUndefined
 from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
@@ -325,6 +327,8 @@ class PRReviewer:
                 get_logger().warning("Fallback models exhausted; publishing successful review chunks")
             if not self.prediction:
                 return None
+
+            await self._verify_key_issues()
 
             pr_review = self._prepare_pr_review()
             get_logger().debug("PR output", artifact=pr_review)
@@ -1040,6 +1044,59 @@ class PRReviewer:
         )
 
         return response
+
+    async def _verify_key_issues(self) -> None:
+        """Optional second-pass gate: drop key issues the diff positively refutes.
+
+        Each 'key_issues_to_review' finding is checked against the diff in one
+        extra model call; unsupported findings are removed before publishing.
+        Fail-open by contract: parsing or model errors keep the original
+        findings — verification may only remove issues, never corrupt the review.
+        """
+        if not get_settings().pr_reviewer.get("verify_findings", False):
+            return
+        try:
+            data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
+            issues = data.get("review", {}).get("key_issues_to_review")
+            if not isinstance(issues, list) or not issues:
+                return
+            prompts = get_settings().pr_verify_findings_prompt
+            environment = Environment(undefined=StrictUndefined)
+            system_prompt = environment.from_string(prompts.system).render({})
+            user_prompt = environment.from_string(prompts.user).render({
+                "diff": self.patches_diff,
+                "issues_yaml": yaml.safe_dump(issues, sort_keys=False),
+                "issue_count": len(issues),
+            })
+            response, _ = await self.ai_handler.chat_completion(
+                model=get_settings().config.model,
+                temperature=0,
+                system=system_prompt,
+                user=user_prompt,
+            )
+            verdicts = load_yaml(response.strip())
+            if not isinstance(verdicts, dict) or not isinstance(verdicts.get("verdicts"), list):
+                get_logger().warning("Findings verification returned no verdicts; keeping original findings")
+                return
+            supported = {
+                int(v["issue"]) for v in verdicts["verdicts"]
+                if isinstance(v, dict) and v.get("supported") is True
+            }
+            # Issues without a verdict are kept: the gate only drops on a positive refute.
+            kept = [issue for i, issue in enumerate(issues, start=1) if i in supported or i > len(verdicts["verdicts"])]
+            if len(kept) == len(issues):
+                get_logger().info("Findings verification kept all key issues")
+                return
+            data["review"]["key_issues_to_review"] = kept
+            # Validate before freezing the filtered data as the review snapshot;
+            # _prepare_pr_review skips schema validation when prediction_data is set.
+            if self.prediction_data is None:
+                self._validate_review_schema(data)
+            self.prediction_data = data
+            get_logger().info(
+                f"Findings verification dropped {len(issues) - len(kept)} of {len(issues)} key issues")
+        except Exception as e:
+            get_logger().warning(f"Findings verification failed; keeping original findings: {e}")
 
     @staticmethod
     def _load_review_yaml(prediction: str) -> dict:
