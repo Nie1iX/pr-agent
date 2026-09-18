@@ -321,7 +321,7 @@ class PRReviewer:
                 await retry_with_fallback_models(self._prepare_prediction, model_type=ModelType.REGULAR,
                                                  git_provider=self.git_provider)
             except Exception as error:
-                if not self._merge_cached_review_chunks():
+                if not await self._merge_cached_review_chunks():
                     raise
                 partial_review_error = error
                 get_logger().warning("Fallback models exhausted; publishing successful review chunks")
@@ -907,7 +907,7 @@ class PRReviewer:
                 raise chunk_errors[0]
             raise ValueError("No valid review output was produced for one or more chunks")
 
-        return self._merge_cached_review_chunks()
+        return await self._merge_cached_review_chunks()
 
     def _resize_pending_review_chunks(self, model: str) -> None:
         """Split oversized pending chunks at file boundaries while preserving result order."""
@@ -985,11 +985,13 @@ class PRReviewer:
             output_token_reserve=getattr(self.ai_handler, "get_output_token_reserve", None),
         )
 
-    def _merge_cached_review_chunks(self) -> bool:
+    async def _merge_cached_review_chunks(self) -> bool:
         """Merge successful chunks in order, retaining incomplete coverage after exhausted retries."""
         chunk_results = getattr(self, "_chunked_results", {})
         if not chunk_results:
             return False
+        if get_settings().pr_reviewer.get("verify_findings", False):
+            await self._verify_chunked_key_issues()
 
         # Keep raw text for logging only; use the merged verdict from self.prediction_data.
         indices = sorted(chunk_results)
@@ -1045,6 +1047,66 @@ class PRReviewer:
 
         return response
 
+    async def _verify_issue_list(self, issues: list, diff: str) -> list:
+        """Second-pass check of key issues against the diff that produced them.
+
+        Returns the issues the model did not explicitly refute: only a verdict
+        with an exact in-range integer 'issue' id and 'supported: false' drops a
+        finding; missing, out-of-order or malformed verdicts keep it.
+        """
+        prompts = get_settings().pr_verify_findings_prompt
+        environment = Environment(undefined=StrictUndefined)
+        system_prompt = environment.from_string(prompts.system).render({})
+        user_prompt = environment.from_string(prompts.user).render({
+            "diff": diff,
+            "issues_yaml": yaml.safe_dump(issues, sort_keys=False),
+            "issue_count": len(issues),
+        })
+        response, _ = await self.ai_handler.chat_completion(
+            model=get_settings().config.model,
+            temperature=0,
+            system=system_prompt,
+            user=user_prompt,
+        )
+        verdicts = load_yaml(response.strip())
+        if not isinstance(verdicts, dict) or not isinstance(verdicts.get("verdicts"), list):
+            get_logger().warning("Findings verification returned no verdicts; keeping original findings")
+            return issues
+        refuted = set()
+        for v in verdicts["verdicts"]:
+            # Exact int required: int() coercion would let values like 1.9 or
+            # true refute issue 1.
+            if (isinstance(v, dict) and v.get("supported") is False
+                    and type(v.get("issue")) is int and 1 <= v["issue"] <= len(issues)):
+                refuted.add(v["issue"])
+        kept = [issue for i, issue in enumerate(issues, start=1) if i not in refuted]
+        if len(kept) < len(issues):
+            get_logger().info(
+                f"Findings verification dropped {len(issues) - len(kept)} of {len(issues)} key issues")
+        return kept
+
+    async def _verify_chunked_key_issues(self) -> None:
+        """Verify every chunk's findings against the diff that produced them.
+
+        Merged findings verified against only the prepared diff would be
+        refuted wholesale, since later chunks carry code the prepared diff
+        lacks. Each chunk result is filtered in place before merging.
+        """
+        chunk_results = getattr(self, "_chunked_results", {})
+        chunks = getattr(self, "_chunked_patches_diff_list", None) or []
+        for index, result in list(chunk_results.items()):
+            try:
+                data = result[1]
+                issues = data.get("review", {}).get("key_issues_to_review")
+                if not isinstance(issues, list) or not issues or index >= len(chunks):
+                    continue
+                kept = await self._verify_issue_list(issues, chunks[index])
+                if len(kept) < len(issues):
+                    data["review"]["key_issues_to_review"] = kept
+            except Exception as e:
+                get_logger().warning(
+                    f"Chunk {index + 1} findings verification failed; keeping its findings: {e}")
+
     async def _verify_key_issues(self) -> None:
         """Optional second-pass gate: drop key issues the diff positively refutes.
 
@@ -1055,50 +1117,22 @@ class PRReviewer:
         """
         if not get_settings().pr_reviewer.get("verify_findings", False):
             return
+        if self.prediction_data is not None:
+            return  # chunked findings were already verified against their own chunk diffs
         try:
-            data = self.prediction_data if self.prediction_data is not None else self._load_review_yaml(self.prediction)
+            data = self._load_review_yaml(self.prediction)
             issues = data.get("review", {}).get("key_issues_to_review")
             if not isinstance(issues, list) or not issues:
                 return
-            prompts = get_settings().pr_verify_findings_prompt
-            environment = Environment(undefined=StrictUndefined)
-            system_prompt = environment.from_string(prompts.system).render({})
-            user_prompt = environment.from_string(prompts.user).render({
-                "diff": self.patches_diff,
-                "issues_yaml": yaml.safe_dump(issues, sort_keys=False),
-                "issue_count": len(issues),
-            })
-            response, _ = await self.ai_handler.chat_completion(
-                model=get_settings().config.model,
-                temperature=0,
-                system=system_prompt,
-                user=user_prompt,
-            )
-            verdicts = load_yaml(response.strip())
-            if not isinstance(verdicts, dict) or not isinstance(verdicts.get("verdicts"), list):
-                get_logger().warning("Findings verification returned no verdicts; keeping original findings")
-                return
-            refuted = set()
-            for v in verdicts["verdicts"]:
-                if isinstance(v, dict) and v.get("supported") is False:
-                    try:
-                        refuted.add(int(v["issue"]))
-                    except (KeyError, TypeError, ValueError):
-                        continue
-            # The gate drops only on an explicit refute: missing, out-of-order or
-            # malformed verdicts keep their issue.
-            kept = [issue for i, issue in enumerate(issues, start=1) if i not in refuted]
+            kept = await self._verify_issue_list(issues, self.patches_diff)
             if len(kept) == len(issues):
                 get_logger().info("Findings verification kept all key issues")
                 return
             data["review"]["key_issues_to_review"] = kept
             # Validate before freezing the filtered data as the review snapshot;
             # _prepare_pr_review skips schema validation when prediction_data is set.
-            if self.prediction_data is None:
-                self._validate_review_schema(data)
+            self._validate_review_schema(data)
             self.prediction_data = data
-            get_logger().info(
-                f"Findings verification dropped {len(issues) - len(kept)} of {len(issues)} key issues")
         except Exception as e:
             get_logger().warning(f"Findings verification failed; keeping original findings: {e}")
 

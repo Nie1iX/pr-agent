@@ -129,3 +129,81 @@ async def test_empty_issue_list_skips_model_call() -> None:
     reviewer.prediction = "review:\n  key_issues_to_review: []\n"
     await reviewer._verify_key_issues()
     reviewer.ai_handler.chat_completion.assert_not_called()
+
+
+async def test_float_and_bool_issue_ids_do_not_refute() -> None:
+    # int() coercion would turn 1.9/true into 1; only exact ints may refute.
+    reviewer = _reviewer(
+        "verdicts:\n"
+        "  - issue: 1.9\n    supported: false\n"
+        "  - issue: true\n    supported: false\n"
+        "  - issue: 2\n    supported: false\n"
+    )
+    await reviewer._verify_key_issues()
+    issues = reviewer.prediction_data["review"]["key_issues_to_review"]
+    assert [i["relevant_file"] for i in issues] == ["src/a.py"]
+
+
+async def test_out_of_range_issue_id_is_ignored() -> None:
+    reviewer = _reviewer("verdicts:\n  - issue: 99\n    supported: false\n")
+    await reviewer._verify_key_issues()
+    assert reviewer.prediction_data is None
+
+
+async def test_merged_findings_skip_second_verification() -> None:
+    # prediction_data set means the chunked path already verified per-chunk.
+    reviewer = _reviewer(VERDICTS_DROP_SECOND)
+    reviewer.prediction_data = {"review": {"key_issues_to_review": [{"issue": "x"}]}}
+    await reviewer._verify_key_issues()
+    reviewer.ai_handler.chat_completion.assert_not_called()
+
+
+def _chunk_data(file_name: str) -> dict:
+    return {"review": {"key_issues_to_review": [
+        {"relevant_file": file_name, "issue_header": "Bug",
+         "issue_content": f"issue in {file_name}", "start_line": 1, "end_line": 2}]}}
+
+
+async def test_each_chunk_verified_against_its_own_diff() -> None:
+    reviewer = _reviewer(VERDICTS_DROP_SECOND)
+    reviewer._chunked_patches_diff_list = ["diff-chunk-A", "diff-chunk-B"]
+    reviewer._chunked_results = {
+        0: ("pred-A", _chunk_data("src/a.py"), "model"),
+        1: ("pred-B", _chunk_data("src/b.py"), "model"),
+    }
+    await reviewer._verify_chunked_key_issues()
+    calls = reviewer.ai_handler.chat_completion.call_args_list
+    assert len(calls) == 2
+    assert "diff-chunk-A" in calls[0].kwargs["user"]
+    assert "diff-chunk-B" in calls[1].kwargs["user"]
+    # Verdict refutes out-of-range issue 2 only: each single-issue chunk keeps its finding.
+    assert len(reviewer._chunked_results[0][1]["review"]["key_issues_to_review"]) == 1
+    assert len(reviewer._chunked_results[1][1]["review"]["key_issues_to_review"]) == 1
+
+
+async def test_chunk_finding_survives_when_its_own_diff_supports_it() -> None:
+    # Chunk A's verifier refutes its finding; chunk B's verifier supports it.
+    reviewer = _reviewer(VERDICTS_DROP_SECOND)
+    reviewer.ai_handler.chat_completion = AsyncMock(side_effect=[
+        ("verdicts:\n  - issue: 1\n    supported: false\n", "stop"),
+        ("verdicts:\n  - issue: 1\n    supported: true\n", "stop"),
+    ])
+    reviewer._chunked_patches_diff_list = ["diff-chunk-A", "diff-chunk-B"]
+    reviewer._chunked_results = {
+        0: ("pred-A", _chunk_data("src/a.py"), "model"),
+        1: ("pred-B", _chunk_data("src/b.py"), "model"),
+    }
+    await reviewer._verify_chunked_key_issues()
+    assert reviewer._chunked_results[0][1]["review"]["key_issues_to_review"] == []
+    kept = reviewer._chunked_results[1][1]["review"]["key_issues_to_review"]
+    assert [i["relevant_file"] for i in kept] == ["src/b.py"]
+
+
+async def test_chunk_verification_error_keeps_that_chunk() -> None:
+    reviewer = _reviewer(VERDICTS_DROP_SECOND)
+    reviewer.ai_handler.chat_completion = AsyncMock(side_effect=RuntimeError("boom"))
+    reviewer._chunked_patches_diff_list = ["diff-chunk-A"]
+    reviewer._chunked_results = {0: ("pred-A", _chunk_data("src/a.py"), "model")}
+    await reviewer._verify_chunked_key_issues()
+    kept = reviewer._chunked_results[0][1]["review"]["key_issues_to_review"]
+    assert [i["relevant_file"] for i in kept] == ["src/a.py"]
