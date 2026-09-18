@@ -47,6 +47,7 @@ from pr_agent.algo.utils import (
     PRReviewIdentity,
     add_pr_review_identity,
     convert_to_markdown_v2,
+    get_max_tokens,
     get_pr_review_comment_identifiers,
     github_action_output,
     hidden_marker_forms,
@@ -1062,6 +1063,15 @@ class PRReviewer:
             "issues_yaml": yaml.safe_dump(issues, sort_keys=False),
             "issue_count": len(issues),
         })
+        try:
+            prompt_tokens = (self.token_handler.count_tokens(system_prompt)
+                             + self.token_handler.count_tokens(user_prompt))
+            if prompt_tokens >= get_max_tokens(model) - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD:
+                get_logger().warning(
+                    "Findings verification prompt exceeds the model budget; keeping original findings")
+                return issues
+        except Exception:
+            get_logger().debug("Findings verification token budgeting failed; proceeding anyway")
         response, _ = await self.ai_handler.chat_completion(
             model=model,
             temperature=0,
