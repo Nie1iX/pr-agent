@@ -50,10 +50,14 @@ def _reviewer(verdicts: str) -> PRReviewer:
 @pytest.fixture(autouse=True)
 def verify_flag():
     snapshot = snapshot_settings(
-        ["pr_reviewer.verify_findings", "config.model", "config.fallback_models"])
+        ["pr_reviewer.verify_findings", "config.model", "config.fallback_models",
+         "config.custom_model_max_tokens"])
     get_settings().set("pr_reviewer.verify_findings", True)
     get_settings().set("config.model", "test-model")
     get_settings().set("config.fallback_models", [])
+    # Without a window for the test model every verification attempt fails its
+    # token budget before reaching the model call.
+    get_settings().set("config.custom_model_max_tokens", 10_000)
     yield
     restore_settings(snapshot)
 

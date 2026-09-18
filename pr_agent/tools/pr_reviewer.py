@@ -6,7 +6,6 @@ from functools import partial
 from typing import List, Optional, Tuple
 
 import yaml
-from jinja2 import Environment, StrictUndefined
 from pydantic import ValidationError
 
 from pr_agent.algo.ai_handlers.base_ai_handler import BaseAiHandler
@@ -47,7 +46,6 @@ from pr_agent.algo.utils import (
     PRReviewIdentity,
     add_pr_review_identity,
     convert_to_markdown_v2,
-    get_max_tokens,
     get_pr_review_comment_identifiers,
     github_action_output,
     hidden_marker_forms,
@@ -1056,27 +1054,35 @@ class PRReviewer:
         finding; missing, out-of-order or malformed verdicts keep it.
         """
         prompts = get_settings().pr_verify_findings_prompt
-        environment = Environment(undefined=StrictUndefined)
-        system_prompt = environment.from_string(prompts.system).render({})
-        user_prompt = environment.from_string(prompts.user).render({
-            "diff": diff,
+        variables = {
+            "diff": "",
             "issues_yaml": yaml.safe_dump(issues, sort_keys=False),
             "issue_count": len(issues),
-        })
-        try:
-            prompt_tokens = (self.token_handler.count_tokens(system_prompt)
-                             + self.token_handler.count_tokens(user_prompt))
-            if prompt_tokens >= get_max_tokens(model) - OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD:
-                get_logger().warning(
-                    "Findings verification prompt exceeds the model budget; keeping original findings")
-                return issues
-        except Exception:
-            get_logger().debug("Findings verification token budgeting failed; proceeding anyway")
+        }
+        budget = AttemptTokenBudget.for_prompt_attempt(
+            model,
+            getattr(self.git_provider, "pr", None),
+            variables,
+            prompts.system,
+            prompts.user,
+            ai_handler=self.ai_handler,
+            output_token_reserve=getattr(self.ai_handler, "get_output_token_reserve", None),
+        )
+        fitted = budget.fit_prompt_variable(
+            variables,
+            "diff",
+            diff,
+            ai_handler=self.ai_handler,
+            default_output_tokens=OUTPUT_BUFFER_TOKENS_SOFT_THRESHOLD,
+        )
+        if fitted.optional_text != diff:
+            raise ValueError(
+                f"The findings verification diff does not fit the token limit for {model}")
         response, _ = await self.ai_handler.chat_completion(
             model=model,
             temperature=0,
-            system=system_prompt,
-            user=user_prompt,
+            system=fitted.system_prompt,
+            user=fitted.user_prompt,
         )
         verdicts = load_yaml(response.strip())
         if not isinstance(verdicts, dict) or not isinstance(verdicts.get("verdicts"), list):

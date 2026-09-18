@@ -158,9 +158,9 @@ to-do list.
 | `review_heading` | "PR Reviewer Guide" | Visible base heading for full and incremental review comments. Identity is tracked separately. |
 | `persistent_finding_state` | true | Persist review finding state across complete review runs. |
 | `inline_key_issues` | false |  |
-| `verify_findings` | false | optional verification gate (opt-in). Run a second model pass that drops only key issues explicitly refuted against the diff; verification follows the configured fallback-model chain and keeps every finding on missing, malformed, or failed verdicts. |
 | `extra_instructions` | "" |  |
 | `num_max_findings` | 3 |  |
+| `verify_findings` | false | Second-pass verification of 'key_issues_to_review': each finding is checked against the diff once more and dropped when the diff positively refutes it. Fail-open: on any verification error the original findings are kept. |
 | `final_update_message` | true |  |
 **review labels**
 
