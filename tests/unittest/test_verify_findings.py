@@ -4,6 +4,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pr_agent.algo.run_details import get_run_details, init_run_details, record_model_used
 from pr_agent.config_loader import get_settings
 from pr_agent.tools.pr_reviewer import PRReviewer
 
@@ -256,3 +257,18 @@ async def test_duplicate_false_verdict_keeps_the_finding() -> None:
     # Both entries agree but the contract demands one verdict per issue:
     # ambiguous output retains the finding, so nothing is dropped.
     assert reviewer.prediction_data is None
+
+
+async def test_verification_fallback_keeps_the_review_model_attribution() -> None:
+    init_run_details()
+    record_model_used("test-model", is_fallback=False)
+    get_settings().set("config.fallback_models", ["fallback-model"])
+    reviewer = _reviewer(VERDICTS_DROP_SECOND)
+    reviewer.ai_handler.chat_completion = AsyncMock(side_effect=[
+        RuntimeError("primary unavailable"),
+        (VERDICTS_DROP_SECOND, "stop"),
+    ])
+    await reviewer._verify_key_issues()
+    assert reviewer.prediction_data is not None
+    details = get_run_details()
+    assert (details.model_used, details.fallback_used) == ("test-model", False)

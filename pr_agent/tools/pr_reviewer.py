@@ -1107,6 +1107,19 @@ class PRReviewer:
                 f"Findings verification dropped {len(issues) - len(kept)} of {len(issues)} key issues")
         return kept
 
+    async def _verify_with_fallback(self, issues: list, diff: str) -> list:
+        """Verify through the fallback chain without relabelling the model that wrote the review."""
+        details = get_run_details()
+        recorded = (details.model_used, details.fallback_used) if details is not None else None
+        try:
+            return await retry_with_fallback_models(
+                partial(self._verify_issue_list, issues, diff),
+                model_type=ModelType.REGULAR,
+                git_provider=self.git_provider)
+        finally:
+            if details is not None:
+                details.model_used, details.fallback_used = recorded
+
     async def _verify_chunked_key_issues(self) -> None:
         """Verify every chunk's findings against the diff that produced them.
 
@@ -1124,10 +1137,7 @@ class PRReviewer:
                     continue
                 # Verification follows the same fallback chain as the review: a
                 # verdict call against an unavailable primary must not skip the gate.
-                kept = await retry_with_fallback_models(
-                    partial(self._verify_issue_list, issues, chunks[index]),
-                    model_type=ModelType.REGULAR,
-                    git_provider=self.git_provider)
+                kept = await self._verify_with_fallback(issues, chunks[index])
                 if len(kept) < len(issues):
                     data["review"]["key_issues_to_review"] = kept
             except Exception as e:
@@ -1152,10 +1162,7 @@ class PRReviewer:
             issues = data.get("review", {}).get("key_issues_to_review")
             if not isinstance(issues, list) or not issues:
                 return
-            kept = await retry_with_fallback_models(
-                partial(self._verify_issue_list, issues, self.patches_diff),
-                model_type=ModelType.REGULAR,
-                git_provider=self.git_provider)
+            kept = await self._verify_with_fallback(issues, self.patches_diff)
             if len(kept) == len(issues):
                 get_logger().info("Findings verification kept all key issues")
                 return
